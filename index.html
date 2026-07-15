@@ -1,0 +1,37 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Helsinki, breathing in light</title><link rel="stylesheet" href="app.css"></head>
+<body>
+<canvas id="map"></canvas>
+
+<div id="intro" role="dialog" aria-modal="true" aria-labelledby="intro-title">
+  <div id="intro-card">
+    <h1 id="intro-title">Helsinki, breathing in light</h1>
+    <p>Every time a bus, tram, or train reaches a stop, a ripple of light spreads out
+       along the streets a rider could walk in three minutes. Where ripples overlap,
+       the city's pulse brightens.</p>
+    <button id="intro-begin" type="button">Show me</button>
+  </div>
+</div>
+
+<div id="stepper" hidden>
+  <div id="stepper-card">
+    <div id="stepper-counter" aria-live="polite">Step <span id="step-num">1</span> / 3</div>
+    <p id="step-caption" aria-live="polite" aria-atomic="true"></p>
+    <div id="stepper-actions">
+      <button id="step-next" type="button">Next</button>
+      <button id="step-explore" type="button" hidden>Explore</button>
+    </div>
+  </div>
+</div>
+
+<div id="chrome" hidden>
+  <div id="clock">–</div>
+  <input id="scrubber" type="range" min="0" max="1" step="0.0001" value="0">
+  <div id="speed-presets"><button data-speed="1">1×</button><button data-speed="60" class="active">60×</button><button data-speed="300">300×</button></div>
+  <button id="play-pause" aria-pressed="false">❬❬</button>
+  <div id="aoi-picker"><button data-aoi="region" class="active">Region</button><button data-aoi="Helsinki">Helsinki</button><button data-aoi="Espoo">Espoo</button><button data-aoi="Vantaa">Vantaa</button><button data-aoi="Kauniainen">Kauniainen</button></div>
+  <div id="status"></div>
+</div>
+<script type="module" src="app.js"></script>
+</body></html>
