@@ -72,6 +72,10 @@ export function resizeCamera(cam, w, h) {
   cam.scale = Math.min(cam.maxScale, Math.max(cam.minScale, cam.scale));
 }
 
+export function viewWidthKm(cam) {
+  return (cam.w * KM_PER_LAT_DEG) / cam.scale;
+}
+
 export function visibleBbox(cam) {
   const [wLon, sLat] = unproject(cam, 0, cam.h);
   const [eLon, nLat] = unproject(cam, cam.w, 0);
@@ -87,6 +91,7 @@ export function startFlyTo(cam, bbox, durationMs = 600) {
   const toScale = Math.min(cam.maxScale, Math.max(cam.minScale,
     fitBboxScale(bbox, cam.w, cam.h, cam.margin, cam.kx)));
   return {
+    bbox,
     from: { cx: cam.cx, cy: cam.cy, scale: cam.scale },
     to: { cx: (bbox[0] + bbox[2]) / 2, cy: (bbox[1] + bbox[3]) / 2, scale: toScale },
     t0: null, durationMs, done: false,

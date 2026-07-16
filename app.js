@@ -18,7 +18,7 @@ import { makeProjection, eventsInWindow, RippleField, realAge, clampSkip,
          rippleLifeHorizon, nextEventInView, whisperText } from "./field.js";
 import { vehiclePosition } from "./vehicles.js";
 import { createCamera, cameraProjection, panBy, zoomAboutPoint, resizeCamera,
-         startFlyTo, stepFlyTo, visibleBbox } from "./camera.js";
+         startFlyTo, stepFlyTo, visibleBbox, viewWidthKm } from "./camera.js";
 import { createDistrictPanel } from "./panel.js";
 
 // ---- AOI bboxes (lon/lat), mirrored from src/region.py EXACTLY -----------
@@ -147,6 +147,10 @@ async function initApp() {
     lifeTau: rp.life_tau ?? 3.0,
   };
 
+  // 1x: the 14 s real-time horizon is otherwise eaten by lifeTau=3
+  // (exp(-14/3) ≈ 0.9%); at 1x the ripple should linger as a visible glow.
+  const RIPPLE_PARAMS_1X = { ...RIPPLE_PARAMS, lifeTau: 6.0 };
+
   // Guided-intro snapshot params: same band, but life decay disabled so the
   // whole isochrone reads at crest brightness (age varies per edge; without
   // this the far edges dim to ~0.19 of the near ones under life_tau=3).
@@ -217,7 +221,9 @@ async function initApp() {
     if (!statusEl) return;
     if (ts - lastStatusTs < STATUS_INTERVAL_MS) return;
     lastStatusTs = ts;
-    const str = "aoi " + state.aoi + " | speed " + state.speed + "x" +
+    const widthKm = viewWidthKm(camera);
+    const widthText = widthKm < 10 ? widthKm.toFixed(1) : String(Math.round(widthKm));
+    const str = "view " + widthText + " km | speed " + state.speed + "x" +
       (state.paused ? " | paused" : "") +
       " | " + Math.round(fpsValue) + " fps";
     if (str !== lastStatusStr) {
@@ -263,6 +269,7 @@ async function initApp() {
                               canvas.clientHeight || window.innerHeight, 24);
   let flyAnim = null;   // in-flight fly-to animation or null
   let introProj = null; // guided-intro override projection (top-cropped) or null
+  const STORY_TOP_FRAC = 0.55;
 
   // viewBbox — the current VIEWPORT extent (spec Q4-A): culling follows the
   // camera, not an AOI/district selection. Districts are navigation only.
@@ -282,6 +289,12 @@ async function initApp() {
     canvas.height = h;
     field.resize(w, h);
     resizeCamera(camera, w, h);
+    if (introProj !== null) {
+      introProj = makeProjection(bboxObj(AOIS.Helsinki), w, h * STORY_TOP_FRAC, 24);
+    }
+    if (flyAnim && !flyAnim.done) {
+      flyAnim = startFlyTo(camera, flyAnim.bbox, 600);
+    }
     syncProjection();
   }
   window.addEventListener("resize", () => fitProjection());
@@ -480,8 +493,11 @@ async function initApp() {
   // in the state object for Task 5's panel (the highlighted district).
   function focusAOI(name) {
     state.aoi = name;
+    state.district = null;
+    districtPanel.setActive(null);
     aoiButtons.forEach((b) => b.classList.toggle("active", b.dataset.aoi === name));
     flyToBbox(AOIS[name]);
+    drawDistrictOutline();
   }
   aoiButtons.forEach((b) => b.addEventListener("click", () => focusAOI(b.dataset.aoi)));
 
@@ -525,8 +541,6 @@ async function initApp() {
   // (clear of the bottom-anchored #stepper-card) so the seeded Helsinki-stop
   // ripple never lands directly underneath the opaque card — it lit up
   // correctly all along, just hidden behind the chrome. See STORY_TOP_FRAC.
-  const STORY_TOP_FRAC = 0.55;
-
   const STORY_STEPS = [
     {
       caption: "One stop, one ripple — the streets a rider can reach on foot in three minutes.",
@@ -913,7 +927,7 @@ async function initApp() {
     // for the paused snapshot): a single shared flush would force one lifeTau
     // on both, either blinking the live ripples or freezing the intro's decay.
     restampActiveEvents();
-    flushStamps();                      // live events, RIPPLE_PARAMS
+    flushStamps(state.speed === 1 ? RIPPLE_PARAMS_1X : RIPPLE_PARAMS); // live events
 
     for (const arr of modeSegs) arr.length = 0;
     for (const arr of modeDelays) arr.length = 0;
