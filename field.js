@@ -20,6 +20,19 @@ export function eventsInWindow(eventTime, ptr, tNow) {
   while (hi < eventTime.length && eventTime[hi] <= tNow) hi++;
   return { events: [ptr, hi], nextPtr: hi };
 }
+// bandBrightness mirrors ripplesim.ripple.edge_brightness (the Python reference):
+// a moving BAND — bright crest at the wavefront (front = age*frontSpeed) + a faint
+// trailing wake — NOT a filled disc. This is the fix for the "whole street brightens"
+// wash. The fragment shader below computes the identical formula per fragment.
+export function bandBrightness(T, age, p) {
+  if (age <= 0) return 0;
+  const front = age * p.frontSpeed;
+  if (T > front) return 0;
+  let crest = 1 - Math.abs(T - front) / p.thickness;
+  if (crest < 0) crest = 0;
+  const wake = Math.exp(-(front - T) / p.wakeTau);
+  return (crest + p.wakeLevel * wake) * Math.exp(-age / p.lifeTau);
+}
 
 // --- WebGL2 decay-accumulate field (Task 7) ------------------------------
 const QUAD_VS = `#version 300 es
@@ -51,12 +64,37 @@ void main(){
 // resorting to a multi-tap blur (kept cheap for the Task-12 perf gate).
 const STAMP_BRIGHTNESS = 1.6;
 const STAMP_VS = `#version 300 es
-in vec2 p; in float inten; uniform vec2 res; out float vI;
-void main(){ vI=inten; vec2 c=(p/res)*2.0-1.0; gl_Position=vec4(c.x,-c.y,0.,1.); }`;
+in vec2 p; in float delay; in float age; uniform vec2 res;
+out float vDelay; out float vAge;
+void main(){ vDelay=delay; vAge=age;
+  vec2 c=(p/res)*2.0-1.0; gl_Position=vec4(c.x,-c.y,0.,1.); }`;
 const STAMP_FS = `#version 300 es
-precision highp float; in float vI; uniform vec3 color; uniform float brightness;
+precision highp float;
+in float vDelay; in float vAge;
+uniform vec3 color; uniform float brightness;
+uniform float frontSpeed, thickness, wakeTau, wakeLevel, lifeTau;
 out vec4 o;
-void main(){ float b = vI * brightness; o = vec4(color * b, b); }`;
+void main(){
+  float T = vDelay; float age = vAge;
+  float front = age * frontSpeed;
+  float b = 0.0;
+  if (age > 0.0 && T <= front) {
+    float crest = max(1.0 - abs(T - front) / thickness, 0.0);
+    float wake = exp(-(front - T) / wakeTau);
+    b = (crest + wakeLevel * wake) * exp(-age / lifeTau);
+  }
+  b *= brightness;
+  o = vec4(color * b, b);   // additive; overlapping ripples ADD
+}`;
+
+const POINT_VS = `#version 300 es
+in vec2 p; in vec4 col; uniform vec2 res; uniform float size;
+out vec4 vCol;
+void main(){ vCol=col; vec2 c=(p/res)*2.0-1.0; gl_Position=vec4(c.x,-c.y,0.,1.); gl_PointSize=size; }`;
+const POINT_FS = `#version 300 es
+precision highp float; in vec4 vCol; out vec4 o;
+void main(){ vec2 d = gl_PointCoord - vec2(0.5); float r = length(d);
+  float a = smoothstep(0.5, 0.0, r); o = vec4(vCol.rgb * a * vCol.a, a * vCol.a); }`;
 
 function compile(gl, vs, fs) {
   const p = gl.createProgram();
@@ -78,11 +116,14 @@ export class RippleField {
     this.decayP = compile(gl, QUAD_VS, DECAY_FS);
     this.presentP = compile(gl, QUAD_VS, PRESENT_FS);
     this.stampP = compile(gl, STAMP_VS, STAMP_FS);
+    this.pointP = compile(gl, POINT_VS, POINT_FS);
     this.quad = gl.createBuffer();
     gl.bindBuffer(gl.ARRAY_BUFFER, this.quad);
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
     this._alloc(width, height);
     this.segBuf = gl.createBuffer(); this.intBuf = gl.createBuffer();
+    this.delayBuf = gl.createBuffer(); this.ageBuf = gl.createBuffer();
+    this.ptBuf = gl.createBuffer(); this.ptColBuf = gl.createBuffer();
 
     // Task 12 perf gate: cache all uniform/attribute locations ONCE per
     // program right after linking, instead of calling getUniformLocation /
@@ -102,12 +143,24 @@ export class RippleField {
       res:        gl.getUniformLocation(this.stampP, "res"),
       color:      gl.getUniformLocation(this.stampP, "color"),
       brightness: gl.getUniformLocation(this.stampP, "brightness"),
+      frontSpeed: gl.getUniformLocation(this.stampP, "frontSpeed"),
+      thickness:  gl.getUniformLocation(this.stampP, "thickness"),
+      wakeTau:    gl.getUniformLocation(this.stampP, "wakeTau"),
+      wakeLevel:  gl.getUniformLocation(this.stampP, "wakeLevel"),
+      lifeTau:    gl.getUniformLocation(this.stampP, "lifeTau"),
       p:          gl.getAttribLocation(this.stampP, "p"),
-      inten:      gl.getAttribLocation(this.stampP, "inten"),
+      delay:      gl.getAttribLocation(this.stampP, "delay"),
+      age:        gl.getAttribLocation(this.stampP, "age"),
     };
     this.presentLoc = {
       tex:          gl.getUniformLocation(this.presentP, "tex"),
       glowStrength: gl.getUniformLocation(this.presentP, "glowStrength"),
+    };
+    this.pointLoc = {
+      res:  gl.getUniformLocation(this.pointP, "res"),
+      size: gl.getUniformLocation(this.pointP, "size"),
+      p:    gl.getAttribLocation(this.pointP, "p"),
+      col:  gl.getAttribLocation(this.pointP, "col"),
     };
   }
   _alloc(w, h) {
@@ -147,7 +200,7 @@ export class RippleField {
     gl.uniform1f(loc.k, k);
     this._drawQuad(this.decayP, this.quadLoc.decay); this.cur = dst;
   }
-  stamp(segVertices, intensities, color) {
+  stamp(segVertices, delays, ages, color, params) {
     const gl = this.gl, loc = this.stampLoc;
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.fbo[this.cur]); gl.viewport(0, 0, this.w, this.h);
     gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);
@@ -155,13 +208,41 @@ export class RippleField {
     gl.uniform2f(loc.res, this.w, this.h);
     gl.uniform3fv(loc.color, color);
     gl.uniform1f(loc.brightness, STAMP_BRIGHTNESS);
+    gl.uniform1f(loc.frontSpeed, params.frontSpeed);
+    gl.uniform1f(loc.thickness, params.thickness);
+    gl.uniform1f(loc.wakeTau, params.wakeTau);
+    gl.uniform1f(loc.wakeLevel, params.wakeLevel);
+    gl.uniform1f(loc.lifeTau, params.lifeTau);
     gl.bindBuffer(gl.ARRAY_BUFFER, this.segBuf);
     gl.bufferData(gl.ARRAY_BUFFER, segVertices, gl.DYNAMIC_DRAW);
     gl.enableVertexAttribArray(loc.p); gl.vertexAttribPointer(loc.p, 2, gl.FLOAT, false, 0, 0);
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.intBuf);
-    gl.bufferData(gl.ARRAY_BUFFER, intensities, gl.DYNAMIC_DRAW);
-    gl.enableVertexAttribArray(loc.inten); gl.vertexAttribPointer(loc.inten, 1, gl.FLOAT, false, 0, 0);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.delayBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, delays, gl.DYNAMIC_DRAW);
+    gl.enableVertexAttribArray(loc.delay); gl.vertexAttribPointer(loc.delay, 1, gl.FLOAT, false, 0, 0);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.ageBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, ages, gl.DYNAMIC_DRAW);
+    gl.enableVertexAttribArray(loc.age); gl.vertexAttribPointer(loc.age, 1, gl.FLOAT, false, 0, 0);
     gl.drawArrays(gl.LINES, 0, segVertices.length / 2);
+  }
+  stampDots(pointsXY, colorsRGBA, sizePx) {
+    const gl = this.gl, loc = this.pointLoc;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.fbo[this.cur]); gl.viewport(0, 0, this.w, this.h);
+    gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);
+    gl.useProgram(this.pointP);
+    gl.uniform2f(loc.res, this.w, this.h);
+    gl.uniform1f(loc.size, sizePx);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.ptBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, pointsXY, gl.DYNAMIC_DRAW);
+    gl.enableVertexAttribArray(loc.p); gl.vertexAttribPointer(loc.p, 2, gl.FLOAT, false, 0, 0);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.ptColBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, colorsRGBA, gl.DYNAMIC_DRAW);
+    gl.enableVertexAttribArray(loc.col); gl.vertexAttribPointer(loc.col, 4, gl.FLOAT, false, 0, 0);
+    gl.drawArrays(gl.POINTS, 0, pointsXY.length / 2);
+  }
+  clearField() {
+    const gl = this.gl;
+    for (const f of this.fbo) { gl.bindFramebuffer(gl.FRAMEBUFFER, f); gl.clear(gl.COLOR_BUFFER_BIT); }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   }
   present() {
     const gl = this.gl, loc = this.presentLoc;

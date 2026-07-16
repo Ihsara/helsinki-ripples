@@ -27,6 +27,18 @@ export async function loadAll(dir) {
   for (const city of Object.keys(manifest.cities)) {
     streets[city] = await loadBin(dir, `street_${city}_seg`, "f32");
   }
+  // Vehicle bins (Task 9, Option A: sim-in-JS interpolation, no baked
+  // per-frame table). Guarded: an older bake without vehicle bins must
+  // still run the app (ripples-only, no moving dots).
+  const [vehicleTripBpTime, vehicleTripBpDist, vehicleShapeCoords, vehicleShapeCumdist] =
+    await Promise.all([
+      loadBin(dir, "trip_bp_time", "u32").catch(() => null),
+      loadBin(dir, "trip_bp_dist", "f32").catch(() => null),
+      loadBin(dir, "shape_coords", "f32").catch(() => null),
+      loadBin(dir, "shape_cumdist", "f32").catch(() => null),
+    ]);
   return { manifest, stops, stopMode, stopCity, stampEdge, stampDelay,
-           stampIntensity, stampIndex, eventStop, eventTime, streets };
+           stampIntensity, stampIndex, eventStop, eventTime, streets,
+           vehicleTripBpTime, vehicleTripBpDist, vehicleShapeCoords, vehicleShapeCumdist,
+           routes: manifest.routes || null, trips: manifest.trips || null };
 }

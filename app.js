@@ -1,12 +1,21 @@
 // app.js — the ripples app: boot, region-wide rAF loop, DOM chrome.
 //
-// Orchestration only: pure logic (projection, decay, stamp windowing, the
-// WebGL field) lives in field.js; binary loading lives in data.js. This
-// module wires those to the DOM and drives one requestAnimationFrame loop
-// that plays the region-wide ripple field on sim-time.
+// Orchestration only: pure logic (projection, band brightness, stamp
+// windowing, the WebGL field) lives in field.js; vehicle interpolation in
+// vehicles.js; binary loading in data.js. This module wires those to the DOM
+// and drives one requestAnimationFrame loop that plays the region-wide
+// ripple field on sim-time.
+//
+// Model (Task 9): each frame the field is CLEARED then every in-flight
+// event's edges are RE-STAMPED with that event's current age; the band
+// shader (field.js STAMP_FS) recomputes crest/wake brightness per-edge from
+// (delay, age) every frame — there's no accumulate/decay step. Moving
+// vehicle dots are interpolated in JS at playback (Option A) and impact dots
+// flash at a stop the instant its event fires.
 
 import { loadAll } from "./data.js";
-import { makeProjection, decayFactor, eventsInWindow, RippleField } from "./field.js";
+import { makeProjection, eventsInWindow, RippleField } from "./field.js";
+import { vehiclePosition } from "./vehicles.js";
 
 // ---- AOI bboxes (lon/lat), mirrored from src/region.py EXACTLY -----------
 const AOIS = {
@@ -30,14 +39,14 @@ const MODE_COLORS = [
 const DATA_DIR = "./data";
 const SPAWN_BUDGET = 200; // max stamped events per frame, even at 300x
 
-// Visual half-life for the decay-accumulate field (Task 11 tuning), decoupled
-// from the bake's manifest.tau_sec (the physics isochrone decay constant).
-// A lone ripple should visually live ~4-8 REAL seconds at the default 60x
-// speed preset; at 60x, RIPPLE_HALF_LIFE_SIM_SEC / 60 = real seconds per
-// half-life. 300 sim-sec / 60 = 5 real-sec per half-life (a ripple reads for
-// several half-lives, so ~10-15 real-sec total fade, clearly visible without
-// lingering forever). Tune here — do not read tau_sec directly for display.
-const RIPPLE_HALF_LIFE_SIM_SEC = 300;
+// mode name -> code, matching ripplesim.vehicles._MODE_CODE / bake_ripples._MODE_CODE.
+const MODE_CODE = (name) => ({ metro: 0, train: 1, tram: 2, bus: 3, ferry: 4 }[name] ?? 3);
+
+// Recent-events look-back window (sim-sec) for the "impact dot" flash at a
+// stop the instant it fires — independent of the ripple horizon (which is
+// much longer). Dot alpha fades linearly to 0 over this window.
+const IMPACT_FADE_SIM_SEC = 8;
+const VEHICLE_DOT_BUDGET = 6000; // cap on stamped vehicle dots per frame (cost bound)
 
 function bboxObj(arr) {
   return { minX: arr[0], minY: arr[1], maxX: arr[2], maxY: arr[3] };
@@ -91,9 +100,12 @@ async function initApp() {
   const dataMin = manifest.data_min;
   const dataMax = manifest.data_max;
   const dataSpan = Math.max(1, dataMax - dataMin);
-  // Note: manifest.tau_sec is the physics isochrone decay constant (baked into
-  // stamp intensities); it is NOT used for the display fade — see
-  // RIPPLE_HALF_LIFE_SIM_SEC above, which is a separate, tunable visual value.
+  // Note: manifest.tau_sec is the physics isochrone decay constant baked into
+  // stamp_delay/stamp_intensity at bake time. Display fade is now driven
+  // live by the band shader's life_tau (see RIPPLE_PARAMS below, sourced
+  // from manifest.ripple.life_tau) — there is no separate visual half-life
+  // constant anymore (the old decay-accumulate model's RIPPLE_HALF_LIFE_SIM_SEC
+  // was retired in Task 9's clear+re-stamp rewrite).
 
   // city code -> name, matching the bake's city_list.index(city) order.
   // Derived from the manifest (not hardcoded) so a bake reorder can't
@@ -110,7 +122,31 @@ async function initApp() {
   const eventStop = d.eventStop;
   const eventTime = d.eventTime;
   const streets = d.streets;
+  const stops = d.stops; // flat [x0,y0, x1,y1, ...] per stop (lon/lat)
   const horizonSec = manifest.horizon_sec;
+
+  // Band-shader ripple params (Task 8's edge_brightness formula), read from
+  // the manifest with sane fallbacks so an older bake without a `ripple`
+  // block still renders (just with default-tuned crest/wake/life values).
+  const rp = manifest.ripple || {};
+  const RIPPLE_PARAMS = {
+    frontSpeed: rp.front_speed ?? 1.0,
+    thickness: rp.thickness ?? 20.0,
+    wakeTau: rp.wake_tau ?? 60.0,
+    wakeLevel: rp.wake_level ?? 0.35,
+    lifeTau: rp.life_tau ?? 90.0,
+  };
+
+  // Vehicle data (Task 9, Option A: sim-in-JS interpolation). Guarded: an
+  // older bake without vehicle bins/manifest.vehicle leaves vehData null,
+  // and the vehicle-dot pass below is skipped entirely — ripples-only.
+  const vehicleMeta = manifest.vehicle || null; // {mode:"sim-in-js", window:[t0,t1]}
+  const vehData = (d.trips && d.routes && d.vehicleTripBpTime && d.vehicleTripBpDist &&
+                   d.vehicleShapeCoords && d.vehicleShapeCumdist) ? {
+    routes: d.routes, trips: d.trips,
+    shapeCoords: d.vehicleShapeCoords, shapeCumdist: d.vehicleShapeCumdist,
+    bpTime: d.vehicleTripBpTime, bpDist: d.vehicleTripBpDist,
+  } : null;
 
   // Boot-time sanity check (T10 rollup / final-review item 7): the guided
   // intro hardcodes two baked stop indices (STORY_STOP_SOLO/PAIR). If a
@@ -337,13 +373,22 @@ async function initApp() {
 
   // Per-mode scratch buffers, reused across frames to avoid GC churn.
   const modeSegs = [[], [], [], [], []];
-  const modeIntens = [[], [], [], [], []];
+  const modeDelays = [[], [], [], [], []];
+  const modeAges = [[], [], [], [], []];
 
   // Resolve one edge (stamp-slice entry k, belonging to `stop`) into a
-  // projected line segment + intensity, pushed into the per-mode scratch
-  // buffers. Shared by both the all-at-once seed path and the wavefront
-  // (crossing) path below — the only difference between them is WHICH k's
-  // get pushed each call, not how a k becomes pixels.
+  // projected line segment + its baked delay + the event's current age,
+  // pushed into the per-mode scratch buffers. Shared by both the all-at-once
+  // seed path and the live wavefront path below — the only difference
+  // between them is WHICH k's get pushed (and what age is passed), not how
+  // a k becomes pixels.
+  //
+  // Band-shader model (Task 8/9): brightness at an edge is recomputed EVERY
+  // FRAME from (delay, age) by the shader, not accumulated by decay(). So
+  // `delay` here is the RAW stampDelay[k] value in seconds (the walking-time
+  // offset at which this edge sits on the wavefront) — NOT divided by 65535;
+  // that /65535 normalization was for the old scalar intensity model, which
+  // the band model no longer uses.
   //
   // AOI filtering: region view stamps every stop (unfiltered — matches the
   // live-verified Task 8 behavior exactly). A city view stamps ONLY stops
@@ -352,7 +397,7 @@ async function initApp() {
   // inside Espoo's, so a first-match bbox test would silently steal
   // Kauniainen's stops into the Espoo view. The bake (Task 4) already
   // resolved that ambiguity once, correctly, into stopCity — trust it.
-  function pushEdge(segArr, mode, k) {
+  function pushEdge(segArr, mode, k, age) {
     const edgeIdx = stampEdge[k];
     const base = 4 * edgeIdx;
     const ax = segArr[base], ay = segArr[base + 1];
@@ -360,9 +405,10 @@ async function initApp() {
     const proj = state.proj;
     const [pax, pay] = proj.fn(ax, ay);
     const [pbx, pby] = proj.fn(bx, by);
-    const inten = stampIntensity[k] / 65535;
+    const delay = stampDelay[k];
     modeSegs[mode].push(pax, pay, pbx, pby);
-    modeIntens[mode].push(inten, inten);
+    modeDelays[mode].push(delay, delay);
+    modeAges[mode].push(age, age);
   }
 
   // Resolve a stop's city buffer + mode, applying the AOI filter. Returns
@@ -383,20 +429,36 @@ async function initApp() {
   // Stamp a stop's ENTIRE isochrone at once, full intensity, no wavefront —
   // the didactic "here's everything reachable in 3 minutes" snapshot used
   // ONLY by the paused guided-intro steps (see seedStopRipple below). Live
-  // playback never calls this; it uses the wavefront-crossing path instead.
+  // playback never calls this; it uses the live re-stamp path instead.
+  //
+  // Age choice for the paused snapshot: pass age = each edge's OWN delay
+  // (age === T), which sits every edge exactly AT its own crest (T === front
+  // in the band formula, since front = age*frontSpeed and frontSpeed==1 by
+  // default gives front===delay). That lights every edge in the isochrone at
+  // full crest brightness simultaneously — the "here's everything reachable"
+  // snapshot the caption describes — without needing a running demo clock.
   function stampEventAllAtOnce(stop) {
     const buf = resolveStopBuffer(stop);
     if (!buf) return;
-    for (let k = buf.off; k < buf.off + buf.cnt; k++) pushEdge(buf.segArr, buf.mode, k);
+    for (let k = buf.off; k < buf.off + buf.cnt; k++) {
+      const age = stampDelay[k] / RIPPLE_PARAMS.frontSpeed;
+      pushEdge(buf.segArr, buf.mode, k, age);
+    }
   }
 
-  // Draw whatever pushEdge() has accumulated into modeSegs/modeIntens,
+  // Draw whatever pushEdge() has accumulated into modeSegs/modeDelays/modeAges,
   // grouped by mode (one draw call per mode, additive blend). Shared by
   // the rAF loop and the scripted intro (seedStopRipple).
   function flushStamps() {
     for (let m = 0; m < modeSegs.length; m++) {
       if (modeSegs[m].length === 0) continue;
-      field.stamp(Float32Array.from(modeSegs[m]), Float32Array.from(modeIntens[m]), MODE_COLORS[m]);
+      field.stamp(
+        Float32Array.from(modeSegs[m]),
+        Float32Array.from(modeDelays[m]),
+        Float32Array.from(modeAges[m]),
+        MODE_COLORS[m],
+        RIPPLE_PARAMS
+      );
     }
   }
 
@@ -419,99 +481,112 @@ async function initApp() {
   function seedStopRipple(stopIndices) {
     const stops = Array.isArray(stopIndices) ? stopIndices : [stopIndices];
     for (const arr of modeSegs) arr.length = 0;
-    for (const arr of modeIntens) arr.length = 0;
+    for (const arr of modeDelays) arr.length = 0;
+    for (const arr of modeAges) arr.length = 0;
     for (const stop of stops) stampEventAllAtOnce(stop);
     flushStamps();
+    // Also persist the resolved buffers so the rAF loop's per-frame
+    // field.clearField() doesn't wipe this seed on the very next frame (see
+    // restampSeededStops below) — a one-shot stampEventAllAtOnce alone only
+    // lasts until the next clear, which for a PAUSED intro step is the very
+    // next frame. Replaces any prior seed (step 2 supersedes step 1's).
+    seededStops = stops.map(resolveStopBuffer).filter((buf) => buf !== null);
   }
 
-  // ---- Live wavefront propagation (final-review) --------------------------
-  // Every stop-event lights its isochrone edges progressively, as the
-  // walking wavefront reaches them — NOT all at once. `stampDelay[k]` is the
-  // baked one-way walking delay (seconds) for edge k in a stop's slice; an
-  // edge should light exactly once, at the sim-frame where the walking-time
-  // age (age = state.t - fireTime) reaches stampDelay[k].
+  // ---- Live ripple re-stamp (Task 9 rewrite) -------------------------------
+  // Band-shader model (Task 8): brightness at an edge is `bandBrightness(T =
+  // stampDelay[k], age, params)`, recomputed fresh every frame from `age` —
+  // there is no accumulated/decaying field state to advance incrementally
+  // anymore. So instead of stamping each edge ONCE when its delay is crossed
+  // (the old cursor-based wavefront-crossing model) and letting field.decay()
+  // fade the accumulated texture, the field is CLEARED and every edge of
+  // every in-flight event is RE-STAMPED each frame with that event's current
+  // age. The shader's own crest/wake formula zeros out edges outside the
+  // band, so the visible result is still a moving ring, not a wash — the
+  // wavefront motion now lives in the shader, not in which edges get pushed.
   //
-  // activeEvents holds one entry per recently-fired event still "in
-  // flight" (age < horizonSec, i.e. its wavefront hasn't finished sweeping
-  // past every one of its edges yet).
+  // activeEvents holds one entry per recently-fired event still "in flight"
+  // (age < horizonSec — after that every one of its edges has decayed under
+  // life_tau well past visibility, so it's dropped to bound per-frame cost).
   //
-  // COST-BOUND DESIGN NOTE: a naive version of this ("for each active
-  // event, scan ALL its edges every frame, testing if delay has been
-  // crossed") would NOT be constant-cost — activeEvents.length grows with
-  // local event DENSITY (roughly density x horizonSec, unbounded by
-  // SPAWN_BUDGET, which only throttles per-frame ADMISSION, not the
-  // resident population), so a busy rush-hour period would scan far more
-  // edges per frame than a quiet one even though only ~SPAWN_BUDGET-worth
-  // of NEW crossings occur per frame. To avoid that, each event's edges
-  // are sorted by delay ONCE at activation time (order = stampEdge indices
-  // sorted ascending by stampDelay), and each event carries a single
-  // cursor into that order. Advancing an event then means: walk the
-  // cursor forward while stampDelay[order[cursor]] <= age, stamping exactly
-  // those edges, and stop — NO scan over not-yet-crossed edges. Total work
-  // across an event's lifetime is still exactly its edge count (each edge
-  // visited once, ever), but now the PER-FRAME cost is exactly bounded by
-  // the number of edges that cross this frame, summed over all active
-  // events — which is bounded by (their combined edge counts) / (frames
-  // spent in flight), i.e. proportional to admitted throughput
-  // (<=SPAWN_BUDGET/frame amortized), not to resident population. This is
-  // the same total work as the old all-at-once stamp, just spread out, and
-  // per-frame cost no longer depends on how many events happen to be
-  // in-flight simultaneously.
-  let activeEvents = []; // { fireTime, buf: {segArr, mode, order, delays}, cursor }
+  // COST-BOUND DESIGN NOTE: per-frame cost is the SUM of edge counts over all
+  // active events (not just the crossings admitted this frame), since every
+  // edge of every in-flight event is pushed every frame. This is bounded by
+  // (local event rate) x horizonSec x (avg edges/event) — the same resident
+  // population the old cursor model was careful about growing, but now each
+  // resident event costs its FULL edge count per frame instead of amortizing
+  // that cost across the frames it takes to cross. This is the necessary
+  // trade for switching to a per-frame-recomputed band (there's no cheaper
+  // way to represent "brightness is a function of age" without baking a
+  // decaying accumulator, which is exactly what produced the wash). The
+  // population itself stays bounded via horizonSec + SPAWN_BUDGET admission,
+  // matching prior behavior; in-flight edge totals remain the same order of
+  // magnitude as before (thousands), not O(all edges) or O(all stops).
+  let activeEvents = []; // { fireTime, buf: {segArr, mode, off, cnt} }
+
+  // Persistent guided-intro seed (Task 10 fix): unlike activeEvents (live,
+  // time-driven, retired by horizonSec), seededStops holds the paused
+  // intro's snapshot buffers so restampSeededStops() below can re-stamp them
+  // every frame — surviving the per-frame field.clearField() the same way
+  // activeEvents does. At most 2 entries (STORY_STOP_SOLO / STORY_STOP_PAIR).
+  let seededStops = [];
 
   function clearActiveEvents() {
     activeEvents = [];
+    seededStops = []; // any stale guided-intro seed must not survive a scrub/AOI-change/wrap either
   }
 
   // Activate a newly-fired event: resolve its city/mode buffer (AOI filter
   // applied here, at activation time — matches the old stampEvent
-  // semantics), pre-sort its stamp-slice entries by delay ONCE (paid at
-  // activation, not per-frame), and push it onto the active ring.
+  // semantics), and push it onto the active ring. No per-edge sort needed
+  // anymore (the old cursor model sorted by delay to advance incrementally;
+  // the re-stamp model pushes every edge every frame regardless of order).
   function activateEvent(stop, fireTime) {
     const buf = resolveStopBuffer(stop);
     if (!buf) return; // wrong AOI / no street buffer / empty slice — nothing to track
-    const { off, cnt } = buf;
-    const order = new Array(cnt);
-    for (let i = 0; i < cnt; i++) order[i] = off + i;
-    order.sort((a, b) => stampDelay[a] - stampDelay[b]);
-    activeEvents.push({ fireTime, buf, order, cursor: 0 });
+    activeEvents.push({ fireTime, buf });
   }
 
-  // Advance every active event by this frame's sim-time step. For each
-  // event, walk its delay-sorted cursor forward while the next edge's
-  // delay has been reached by `age` — stamping ONLY edges that cross the
-  // wavefront this frame, never re-scanning edges already stamped or not
-  // yet due. Retires events whose cursor has exhausted every edge (or
-  // whose age has passed the horizon — belt-and-suspenders, since every
-  // edge's delay is baked <= horizonSec, the cursor should always exhaust
-  // by then too). Pushes into the shared modeSegs/modeIntens scratch
-  // buffers (caller flushes).
-  function advanceWavefronts() {
+  // Re-stamp every active event's full edge set this frame, using the
+  // event's current age (age = state.t - fireTime, same value for every edge
+  // of that event — the band shader is what differentiates brightness across
+  // edges via each edge's own stampDelay). Retires events whose age has
+  // passed horizonSec. Pushes into the shared modeSegs/modeDelays/modeAges
+  // scratch buffers (caller flushes).
+  function restampActiveEvents() {
     const now = state.t;
     let write = 0;
     for (let i = 0; i < activeEvents.length; i++) {
       const ev = activeEvents[i];
       const age = now - ev.fireTime;
-      const { segArr, mode } = ev.buf;
-      const order = ev.order;
-      // The cursor-based crossing test below (stampDelay[order[ev.cursor]] <= age)
-      // is the inline equivalent of the tested helper stampContribution(delay, intensity, age).
-      while (ev.cursor < order.length && stampDelay[order[ev.cursor]] <= age) {
-        pushEdge(segArr, mode, order[ev.cursor]);
-        ev.cursor++;
-      }
-      if (ev.cursor < order.length && age < horizonSec) {
-        activeEvents[write++] = ev; // edges remain AND still inside the horizon — keep
-      }
-      // else: either every edge has crossed (cursor exhausted) or the
-      // horizon has passed (defensive) — retire either way.
+      if (age >= horizonSec) continue; // retire: past the baked isochrone horizon
+      const { segArr, mode, off, cnt } = ev.buf;
+      for (let k = off; k < off + cnt; k++) pushEdge(segArr, mode, k, age);
+      activeEvents[write++] = ev;
     }
     activeEvents.length = write;
   }
 
+  // Re-stamp the guided-intro's seeded stops (see seededStops above) every
+  // frame, same reason as restampActiveEvents: the field is cleared each
+  // frame, so anything not re-pushed vanishes on the next frame. Age is
+  // pinned to each edge's own delay (age === T, matching stampEventAllAtOnce)
+  // so the full isochrone sits at crest brightness simultaneously — the
+  // static "here's everything reachable" snapshot the intro captions
+  // describe, not an animating wavefront.
+  function restampSeededStops() {
+    for (let i = 0; i < seededStops.length; i++) {
+      const { segArr, mode, off, cnt } = seededStops[i];
+      for (let k = off; k < off + cnt; k++) {
+        const age = stampDelay[k] / RIPPLE_PARAMS.frontSpeed;
+        pushEdge(segArr, mode, k, age);
+      }
+    }
+  }
+
   // ---- Task 12: hidden-tab pause -------------------------------------------
   // A backgrounded tab still gets rAF callbacks (throttled by the browser,
-  // but not zero), so without this guard the field keeps decaying/stamping
+  // but not zero), so without this guard the field keeps clearing/re-stamping
   // off-screen — wasted GPU/battery. Skip all sim work while hidden.
   //
   // On resume, reset lastFrameTs to null so the next visible frame treats
@@ -553,17 +628,24 @@ async function initApp() {
       state.t = tNext;
     }
 
-    field.decay(decayFactor(RIPPLE_HALF_LIFE_SIM_SEC, dtSim));
+    // Band-shader model: brightness is recomputed from age every frame, so
+    // the field must be CLEARED then RE-STAMPED from scratch each frame
+    // (no accumulate/decay step anymore — see restampActiveEvents' doc
+    // comment). A paused frame still clears+re-stamps (so the guided-intro
+    // snapshot stays lit while paused); only sim-time advancement and event
+    // activation are gated on dtSim > 0 below.
+    field.clearField();
+
+    for (const arr of modeSegs) arr.length = 0;
+    for (const arr of modeDelays) arr.length = 0;
+    for (const arr of modeAges) arr.length = 0;
 
     if (dtSim > 0) {
-      for (const arr of modeSegs) arr.length = 0;
-      for (const arr of modeIntens) arr.length = 0;
-
       // Activate newly-fired events (same forward-only sweep + stride
       // sampling as before — SPAWN_BUDGET still caps how many events join
       // the active ring per frame, even at 300x). Activation does NOT
-      // stamp anything yet; it just registers the event so its wavefront
-      // starts advancing from the NEXT line below.
+      // stamp anything yet; it just registers the event so it starts being
+      // re-stamped from the NEXT line below.
       const { events, nextPtr } = eventsInWindow(eventTime, state.sePtr, state.t);
       const [lo, hi] = events;
       const pending = hi - lo;
@@ -573,14 +655,73 @@ async function initApp() {
           activateEvent(eventStop[i], eventTime[i]);
         }
       }
-      state.sePtr = nextPtr; // forward-only: never re-stamp an already-swept event
+      state.sePtr = nextPtr; // forward-only: never re-activate an already-swept event
+    }
 
-      // Advance every active event's wavefront by this frame's dtSim,
-      // stamping only the edges the wavefront crosses THIS frame (see
-      // advanceWavefronts' doc comment for the constant-cost argument).
-      advanceWavefronts();
+    // Re-stamp every active event's full edge set at its current age (see
+    // restampActiveEvents' doc comment for the cost-bound argument). This
+    // runs even when paused (dtSim === 0) so the field stays lit between
+    // frames instead of flashing empty (clearField() above wiped it).
+    restampActiveEvents();
+    restampSeededStops();
+    flushStamps();
 
-      flushStamps();
+    // ---- Vehicle dots (Task 9 Part D, Option A) -----------------------------
+    // Interpolate every live trip's XY in JS at state.t (ported, tested
+    // vehiclePosition — see vehicles.js), AOI-cull, project, color by mode.
+    // Guarded: an older bake without vehicle bins (vehData null) simply
+    // skips this pass — ripples-only. Runs only while playing (a paused
+    // frame has no meaningful "live" vehicle set — state.t isn't advancing).
+    if (vehData && vehicleMeta && !state.paused) {
+      const pts = [], cols = [];
+      const bb = AOIS[state.aoi];
+      let pushed = 0;
+      for (let ti = 0; ti < vehData.trips.length && pushed < VEHICLE_DOT_BUDGET; ti++) {
+        const trip = vehData.trips[ti];
+        const pos = vehiclePosition(trip, state.t, vehData);
+        if (!pos) continue;
+        const [x, y] = pos;
+        // AOI cull: skip if outside the current projection bbox (cheap lon/lat test).
+        if (x < bb[0] || x > bb[2] || y < bb[1] || y > bb[3]) continue;
+        const [px, py] = state.proj.fn(x, y);
+        const mode = MODE_CODE(vehData.routes[trip.shape].mode);
+        const c = MODE_COLORS[mode];
+        pts.push(px, py); cols.push(c[0], c[1], c[2], 0.9);
+        pushed++;
+      }
+      if (pts.length) field.stampDots(Float32Array.from(pts), Float32Array.from(cols), 5.0);
+    }
+
+    // ---- Impact dots ---------------------------------------------------------
+    // A bright flash at the exact stop coordinate the instant an event fires,
+    // fading out linearly over IMPACT_FADE_SIM_SEC — a short, independent
+    // look-back over the tail of already-activated events (bounded by how
+    // many events fired in the last few sim-sec, not by activeEvents' full
+    // in-flight population).
+    {
+      const cutoff = state.t - IMPACT_FADE_SIM_SEC;
+      let lo = lowerBound(eventTime, cutoff);
+      const hi = state.sePtr; // events up to (not including) the not-yet-activated tail
+      const pts = [], cols = [];
+      for (let i = lo; i < hi; i++) {
+        const et = eventTime[i];
+        if (et > state.t) continue; // defensive: shouldn't happen (sePtr is forward-only)
+        const age = state.t - et;
+        if (age < 0 || age >= IMPACT_FADE_SIM_SEC) continue;
+        const stop = eventStop[i];
+        const cityCode = stopCity[stop];
+        if (cityCode === REGION_ONLY_CITY_CODE) continue;
+        const cityName = CITY_NAMES[cityCode];
+        if (state.aoi !== "region" && cityName !== state.aoi) continue;
+        const x = stops[2 * stop], y = stops[2 * stop + 1];
+        const bb = AOIS[state.aoi];
+        if (x < bb[0] || x > bb[2] || y < bb[1] || y > bb[3]) continue;
+        const [px, py] = state.proj.fn(x, y);
+        const alpha = 1 - age / IMPACT_FADE_SIM_SEC;
+        const c = MODE_COLORS[stopMode[stop]];
+        pts.push(px, py); cols.push(c[0], c[1], c[2], alpha);
+      }
+      if (pts.length) field.stampDots(Float32Array.from(pts), Float32Array.from(cols), 8.0);
     }
 
     field.present();
