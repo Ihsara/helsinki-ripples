@@ -14,8 +14,12 @@
 // flash at a stop the instant its event fires.
 
 import { loadAll } from "./data.js";
-import { makeProjection, eventsInWindow, RippleField, realAge, clampSkip, inBbox } from "./field.js";
+import { makeProjection, eventsInWindow, RippleField, realAge, clampSkip,
+         rippleLifeHorizon, nextEventInView } from "./field.js";
 import { vehiclePosition } from "./vehicles.js";
+import { createCamera, cameraProjection, panBy, zoomAboutPoint, resizeCamera,
+         startFlyTo, stepFlyTo, visibleBbox } from "./camera.js";
+import { createDistrictPanel } from "./panel.js";
 
 // ---- AOI bboxes (lon/lat), mirrored from src/region.py EXACTLY -----------
 const AOIS = {
@@ -74,6 +78,7 @@ async function initApp() {
   const canvas = document.getElementById("map");
   const statusEl = document.getElementById("status");
   const clockEl = document.getElementById("clock");
+  const whisperEl = document.getElementById("whisper");
   const scrubberEl = document.getElementById("scrubber");
   const playPauseEl = document.getElementById("play-pause");
   const skipBackEl = document.getElementById("skip-back");
@@ -147,10 +152,6 @@ async function initApp() {
   // this the far edges dim to ~0.19 of the near ones under life_tau=3).
   const INTRO_PARAMS = { ...RIPPLE_PARAMS, lifeTau: 1e9 };
 
-  // Real-seconds visual life ceiling: crest sweep (horizon/frontSpeed = 5s)
-  // + wake/life tail. Events older than this are invisible; retire them.
-  const RIPPLE_LIFE_HORIZON_REAL_SEC = 8.0;
-
   // Vehicle data (Task 9, Option A: sim-in-JS interpolation). Guarded: an
   // older bake without vehicle bins/manifest.vehicle leaves vehData null,
   // and the vehicle-dot pass below is skipped entirely — ripples-only.
@@ -217,13 +218,25 @@ async function initApp() {
     if (ts - lastStatusTs < STATUS_INTERVAL_MS) return;
     lastStatusTs = ts;
     const str = "aoi " + state.aoi + " | speed " + state.speed + "x" +
-      (state.speed === 1 && !state.paused ? " (real-time — events are rare)" : "") +
       (state.paused ? " | paused" : "") +
       " | " + Math.round(fpsValue) + " fps";
     if (str !== lastStatusStr) {
       lastStatusStr = str;
       statusEl.textContent = str;
     }
+
+    // 1x whisper (spec §4): only at real time, only while playing; human
+    // phrasing, never engine terms. delta is SIM seconds, which at 1x IS
+    // real seconds.
+    let w = "";
+    if (state.speed === 1 && !state.paused) {
+      const nxt = nextEventInView(eventTime, eventStop, stops, state.sePtr, viewBbox());
+      if (nxt) {
+        const dsec = Math.max(0, Math.round(nxt.simSec - state.t));
+        w = dsec <= 1 ? "ripple…" : `next ripple · ${dsec}s`;
+      }
+    }
+    if (whisperEl && w !== whisperEl.textContent) whisperEl.textContent = w;
   }
 
   // ---- WebGL field + projection ------------------------------------------
@@ -237,57 +250,168 @@ async function initApp() {
     return;
   }
 
-  // `usableH` lets a caller confine the projection to the TOP portion of the
-  // canvas (e.g. clear of the bottom-anchored #stepper-card during the guided
-  // intro), so a seeded ripple never lands directly underneath opaque UI
-  // chrome. Free-explore always passes the full height (default), unchanged.
+  // The guided intro confines its snapshot projection (introProj) to the TOP
+  // portion of the canvas (clear of the bottom-anchored #stepper-card) so a
+  // seeded ripple never lands directly underneath opaque UI chrome — see
+  // STORY_TOP_FRAC / STORY_STEPS below. Free-explore's camera always uses
+  // the full canvas height.
   const overlay = document.getElementById("overlay");
   const octx = overlay.getContext("2d");
 
-  // viewBbox — the bbox currently governing camera + admission + dot culls:
-  // a focused district's bbox when set, else the whole AOI's bbox. Shared by
-  // fitProjection, resolveStopBuffer, and both dot-cull loops so a district
-  // focus and the AOI fallback can never drift apart.
+  // ---- v2.2 free camera ----------------------------------------------------
+  const camera = createCamera(AOIS.region, canvas.clientWidth || window.innerWidth,
+                              canvas.clientHeight || window.innerHeight, 24);
+  let flyAnim = null;   // in-flight fly-to animation or null
+  let introProj = null; // guided-intro override projection (top-cropped) or null
+
+  // viewBbox — the current VIEWPORT extent (spec Q4-A): culling follows the
+  // camera, not an AOI/district selection. Districts are navigation only.
   function viewBbox() {
-    return state.district ? state.district.bbox : AOIS[state.aoi];
+    return visibleBbox(camera);
   }
 
-  function fitProjection(usableH) {
+  function syncProjection() {
+    state.proj = introProj || cameraProjection(camera);
+    drawDistrictOutline();
+  }
+
+  function fitProjection() {
     const w = canvas.clientWidth || window.innerWidth;
     const h = canvas.clientHeight || window.innerHeight;
     canvas.width = w;
     canvas.height = h;
     field.resize(w, h);
-    const bb = state.district ? bboxObj(state.district.bbox) : bboxObj(AOIS[state.aoi]);
-    state.proj = makeProjection(bb, w, usableH || h, 24);
-    drawDistrictOutline();
+    resizeCamera(camera, w, h);
+    syncProjection();
   }
   window.addEventListener("resize", () => fitProjection());
 
-  // drawDistrictOutline — the focused district's ring as a faint STATIC line,
-  // drawn once per camera change (not per rAF frame: the band shader's own
-  // additive stamp pipeline would animate it, and stampDots only does points —
-  // a plain 2D overlay canvas is the simplest correct tool for a static shape).
-  // Sized to match the map canvas every call so a resize never leaves it
-  // stale/mis-scaled.
-  function drawDistrictOutline() {
-    overlay.width = canvas.width;
-    overlay.height = canvas.height;
-    octx.clearRect(0, 0, overlay.width, overlay.height);
-    if (!state.district) return;
-    octx.strokeStyle = "rgba(255,255,255,0.12)";
-    octx.lineWidth = 1;
+  // flyToBbox — animated camera move (spec §1). NO field clear, NO sePtr
+  // resync: playback and camera are orthogonal; the world keeps rippling
+  // while the camera moves.
+  function flyToBbox(bbox) {
+    flyAnim = startFlyTo(camera, bbox, 600);
+  }
+
+  // drawDistrictOutline — static 2D overlay: the SELECTED district's ring
+  // (soft white) + the HOVERED row's ring (brighter pre-glow). Redrawn on
+  // camera change / selection / hover — never per rAF frame. The selection
+  // ring fades out once the camera center leaves its bbox by more than one
+  // bbox-width (it is a hint, not a mode — spec §3).
+  function ringPath(ring) {
     octx.beginPath();
-    const ring = state.district.ring;
     for (let i = 0; i < ring.length; i++) {
       const [px, py] = state.proj.fn(ring[i][0], ring[i][1]);
       if (i === 0) octx.moveTo(px, py); else octx.lineTo(px, py);
     }
     octx.closePath();
-    octx.stroke();
+  }
+  function selectionAlpha(bbox) {
+    const cx = camera.cx, cy = camera.cy;
+    const w = bbox[2] - bbox[0], h = bbox[3] - bbox[1];
+    const dx = Math.max(0, Math.max(bbox[0] - cx, cx - bbox[2])) / Math.max(w, 1e-9);
+    const dy = Math.max(0, Math.max(bbox[1] - cy, cy - bbox[3])) / Math.max(h, 1e-9);
+    return Math.max(0, 1 - Math.max(dx, dy)); // 1 inside, 0 one bbox-width away
+  }
+  function drawDistrictOutline() {
+    overlay.width = canvas.width;
+    overlay.height = canvas.height;
+    octx.clearRect(0, 0, overlay.width, overlay.height);
+    if (!state.proj) return;
+    if (state.district) {
+      const a = selectionAlpha(state.district.bbox);
+      if (a > 0.01) {
+        octx.strokeStyle = `rgba(255,255,255,${(0.14 * a).toFixed(3)})`;
+        octx.lineWidth = 1;
+        ringPath(state.district.ring);
+        octx.stroke();
+      }
+    }
+    if (state.hoverDistrict && state.hoverDistrict !== state.district) {
+      octx.strokeStyle = "rgba(111,211,230,0.35)"; // #6fd3e6 pre-glow
+      octx.lineWidth = 1.5;
+      ringPath(state.hoverDistrict.ring);
+      octx.stroke();
+    }
   }
 
+  // ---- v2.2 district panel: navigation + highlight only ------------------
+  state.hoverDistrict = null; // pre-glow outline (hover), independent of selection
+
+  const panelRoot = document.getElementById("district-panel");
+  const districtPanel = createDistrictPanel(panelRoot,
+    (districts && districts.schema === 2) ? districts : null, {
+    onSelect(entry) {
+      state.district = entry;
+      districtPanel.setActive(entry);
+      flyToBbox(entry.bbox);
+      drawDistrictOutline();
+    },
+    onHover(entry) {
+      state.hoverDistrict = entry;
+      drawDistrictOutline();
+    },
+  });
+
   fitProjection();
+
+  // ---- camera input: drag = pan, wheel = zoom-about-cursor, pinch = zoom.
+  // Attached to #overlay's parent stack via window-level pointer events on
+  // the canvas (the overlay canvas is pointer-events:none). Any manual
+  // camera input cancels an in-flight fly-to (the user grabbed the wheel).
+  // Camera is LOCKED while the intro card or the guided tour is showing (the
+  // canvas still receives pointer events under that chrome).
+  const pointers = new Map(); // pointerId -> {x, y}
+  let lastPinchDist = null;
+
+  canvas.addEventListener("pointerdown", (e) => {
+    if (!introEl.hidden || !stepperEl.hidden) return; // camera locked during intro/tour
+    canvas.setPointerCapture(e.pointerId);
+    pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    flyAnim = null;
+  });
+  canvas.addEventListener("pointermove", (e) => {
+    const p = pointers.get(e.pointerId);
+    if (!p) return;
+    if (pointers.size === 1) {
+      panBy(camera, -(e.clientX - p.x), -(e.clientY - p.y));
+      syncProjection();
+    } else if (pointers.size === 2) {
+      p.x = e.clientX; p.y = e.clientY; // update first, measure both below
+      const [a, b] = [...pointers.values()];
+      const dist = Math.hypot(a.x - b.x, a.y - b.y);
+      if (lastPinchDist !== null && dist > 0) {
+        const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+        zoomAboutPoint(camera, mx, my, dist / lastPinchDist);
+        syncProjection();
+      }
+      lastPinchDist = dist;
+      return; // don't fall through to the single-pointer position update
+    }
+    p.x = e.clientX; p.y = e.clientY;
+  });
+  const endPointer = (e) => {
+    pointers.delete(e.pointerId);
+    if (pointers.size < 2) lastPinchDist = null;
+  };
+  canvas.addEventListener("pointerup", endPointer);
+  canvas.addEventListener("pointercancel", endPointer);
+
+  canvas.addEventListener("wheel", (e) => {
+    e.preventDefault(); // always stop page-scroll, even while locked
+    if (!introEl.hidden || !stepperEl.hidden) return; // camera locked during intro/tour
+    flyAnim = null;
+    const factor = Math.exp(-e.deltaY * 0.0015); // smooth, ~1.16x per notch
+    zoomAboutPoint(camera, e.clientX, e.clientY, factor);
+    syncProjection();
+  }, { passive: false });
+
+  canvas.addEventListener("dblclick", (e) => {
+    if (!introEl.hidden || !stepperEl.hidden) return; // camera locked during intro/tour
+    flyAnim = null;
+    zoomAboutPoint(camera, e.clientX, e.clientY, 1.6);
+    syncProjection();
+  });
 
   // ---- clock / scrubber formatting ---------------------------------------
   function formatClock(t) {
@@ -351,59 +475,20 @@ async function initApp() {
     setPaused(!state.paused);
   });
 
-  // ---- AOI picker: reframe the projection to the chosen city's bbox and
-  // (via the rAF loop's stamp filter, below) restrict stamped ripples to
-  // that city's own street segments. Region shows every city, unfiltered.
-  function focusAOI(name, usableH) {
-    state.district = null; // a district belongs to one city; never survives an AOI switch
+  // AOI chips are fly-to shortcuts now (spec Q4-A): no filtering, no field
+  // clear, no sePtr resync — the camera just travels. state.district stays
+  // in the state object for Task 5's panel (the highlighted district).
+  function focusAOI(name) {
     state.aoi = name;
     aoiButtons.forEach((b) => b.classList.toggle("active", b.dataset.aoi === name));
-    fitProjection(usableH); // reprojects to AOIS[name] AND clears the field (field.resize)
-    state.sePtr = lowerBound(eventTime, state.t); // hard re-sync, like a scrub
-    clearActiveEvents(); // stale wavefronts reference the OLD AOI's resolved city buffer
-    renderDistrictPicker();
+    flyToBbox(AOIS[name]);
   }
   aoiButtons.forEach((b) => b.addEventListener("click", () => focusAOI(b.dataset.aoi)));
-
-  // ---- District picker (Task 6): a second chip row that appears once a city
-  // AOI is focused, listing that city's major districts (from the Task 5
-  // bake) as camera presets. "All" clears the focus back to the whole city.
-  // Region view has no districts list, so the row stays hidden there.
-  const districtPickerEl = document.getElementById("district-picker");
-
-  function renderDistrictPicker() {
-    const list = (districts && state.aoi !== "region" && districts[state.aoi]) || null;
-    districtPickerEl.hidden = !list;
-    districtPickerEl.textContent = "";
-    if (!list) return;
-    const mk = (label, dist) => {
-      const b = document.createElement("button");
-      b.type = "button";
-      b.textContent = label;
-      b.classList.toggle("active", (state.district?.name ?? null) === (dist?.name ?? null));
-      b.addEventListener("click", () => focusDistrict(dist));
-      districtPickerEl.appendChild(b);
-    };
-    mk("All", null);
-    for (const dist of list) mk(dist.name, dist);
-  }
-
-  // District select = same hard-jump semantics as an AOI change: refit the
-  // camera (clears the field via fitProjection->field.resize), resync the
-  // event cursor, drop stale in-flight wavefronts.
-  function focusDistrict(dist) {
-    state.district = dist;
-    fitProjection();
-    state.sePtr = lowerBound(eventTime, state.t);
-    clearActiveEvents();
-    renderDistrictPicker();
-  }
 
   // ---- initial cursor position --------------------------------------------
   state.sePtr = lowerBound(eventTime, state.t);
   updateScrubberFromT();
   clockEl.textContent = formatClock(state.t);
-  renderDistrictPicker(); // boot state is aoi:"region" — row starts hidden
 
   // v2.1 intro: ONE dismissible card, sim PLAYING behind it, remembered.
   // The 3-step guided tour still exists — now opt-in behind the ? button.
@@ -447,7 +532,12 @@ async function initApp() {
       caption: "One stop, one ripple — the streets a rider can reach on foot in three minutes.",
       run() {
         setPaused(true);
-        focusAOI("Helsinki", canvas.clientHeight * STORY_TOP_FRAC);
+        // Top-cropped STATIC projection for the seeded ripple (clear of the
+        // bottom stepper card) — the camera is bypassed during the tour.
+        introProj = makeProjection(bboxObj(AOIS.Helsinki), canvas.clientWidth,
+                                   canvas.clientHeight * STORY_TOP_FRAC, 24);
+        syncProjection();
+        field.resize(canvas.width, canvas.height);
         seedStopRipple(STORY_STOP_SOLO);
       },
     },
@@ -465,6 +555,7 @@ async function initApp() {
     {
       caption: "Now the whole morning — thousands of ripples, the city breathing in light.",
       run() {
+        introProj = null;         // hand the view back to the free camera
         focusAOI("region");
         setSpeed(60);
         setPaused(false);
@@ -493,6 +584,11 @@ async function initApp() {
   }
 
   function endStory() {
+    // A user who exits the tour early via Explore (mid step 1/2) must get
+    // the free camera back — introProj may still be set to the top-cropped
+    // override.
+    introProj = null;
+    syncProjection();
     stepperEl.hidden = true;
     chromeEl.hidden = false;
     // Hand off cleanly to free-explore: resync the sim cursor to "now" so
@@ -530,13 +626,11 @@ async function initApp() {
   // that /65535 normalization was for the old scalar intensity model, which
   // the band model no longer uses.
   //
-  // AOI filtering: region view stamps every stop (unfiltered — matches the
-  // live-verified Task 8 behavior exactly). A city view stamps ONLY stops
-  // whose BAKED stopCity code names that city. This must NOT be re-derived
-  // from bbox containment client-side: Kauniainen's bbox nests entirely
-  // inside Espoo's, so a first-match bbox test would silently steal
-  // Kauniainen's stops into the Espoo view. The bake (Task 4) already
-  // resolved that ambiguity once, correctly, into stopCity — trust it.
+  // Every stop stamps unconditionally (v2.2 retired AOI/district admission
+  // filtering — spec Q4-A): resolveStopBuffer only decides WHICH city street
+  // buffer a stop's edges live in (via the baked stopCity code — never
+  // re-derived from bbox containment client-side, since Kauniainen's bbox
+  // nests entirely inside Espoo's), not WHETHER to stamp it.
   function pushEdge(segArr, mode, k, age) {
     const edgeIdx = stampEdge[k];
     const base = 4 * edgeIdx;
@@ -551,21 +645,17 @@ async function initApp() {
     modeAges[mode].push(age, age);
   }
 
-  // Resolve a stop's city buffer + mode, applying the AOI filter. Returns
-  // null if this stop should not be stamped in the current view (wrong
-  // city, no street buffer, or an empty stamp slice).
+  // Resolve a stop's city street-buffer + mode. Returns null if this stop
+  // cannot be stamped at all (no street buffer or an empty stamp slice) —
+  // NOT an AOI/district admission test: v2.2 retired admission filtering
+  // (spec Q4-A). Districts and AOI chips are navigation-only; culling is by
+  // the live viewport (see viewBbox/visibleBbox), not by selection.
   function resolveStopBuffer(stop) {
     const cnt = stampIndex[2 * stop + 1];
     if (cnt === 0) return null;
     const cityCode = stopCity[stop];
     if (cityCode === REGION_ONLY_CITY_CODE) return null; // no street buffer for this stop
     const cityName = CITY_NAMES[cityCode];
-    if (state.aoi !== "region" && cityName !== state.aoi) return null; // wrong city for this AOI
-    if (state.district &&
-        !inBbox(stops[2 * stop], stops[2 * stop + 1], state.district.bbox)) {
-      return null; // outside the focused district — bbox test; edge spill-over
-                    // from admitted stops still renders (whole-city street buffer)
-    }
     const segArr = streets[cityName];
     if (!segArr) return null;
     return { segArr, mode: stopMode[stop], off: stampIndex[2 * stop], cnt };
@@ -706,7 +796,7 @@ async function initApp() {
       const age = realAge(now - ev.fireTime, state.speed);
       // retire on REAL age (visual life over) OR a sim-age cap so scrubbing
       // far ahead can't keep a huge stale population alive at high speed.
-      if (age >= RIPPLE_LIFE_HORIZON_REAL_SEC || now - ev.fireTime >= 5 * horizonSec) continue;
+      if (age >= rippleLifeHorizon(state.speed) || now - ev.fireTime >= 5 * horizonSec) continue;
       const { segArr, mode, off, cnt } = ev.buf;
       for (let k = off; k < off + cnt; k++) pushEdge(segArr, mode, k, age);
       activeEvents[write++] = ev;
@@ -758,6 +848,14 @@ async function initApp() {
     const dtRealMs = state.paused ? 0 : ts - state.lastFrameTs;
     state.lastFrameTs = ts;
     recordFrameDt(dtRealMs);
+
+    // v2.2: advance an in-flight fly-to; sync the projection every frame the
+    // camera is animating (manual input syncs eagerly in its own handlers).
+    if (flyAnim) {
+      const flying = stepFlyTo(flyAnim, camera, ts);
+      if (!flying) flyAnim = null;
+      syncProjection();
+    }
 
     const dtSim = (dtRealMs * state.speed) / 1000;
 
@@ -826,7 +924,7 @@ async function initApp() {
 
     // ---- Vehicle dots (Task 9 Part D, Option A) -----------------------------
     // Interpolate every live trip's XY in JS at state.t (ported, tested
-    // vehiclePosition — see vehicles.js), AOI-cull, project, color by mode.
+    // vehiclePosition — see vehicles.js), viewport-cull, project, color by mode.
     // Guarded: an older bake without vehicle bins (vehData null) simply
     // skips this pass — ripples-only. Runs only while playing (a paused
     // frame has no meaningful "live" vehicle set — state.t isn't advancing).
@@ -834,20 +932,24 @@ async function initApp() {
       const pts = [], cols = [];
       const bb = viewBbox();
       let pushed = 0;
+      // 1x: vehicles are the visible life at real time — bigger, brighter (spec §4).
+      const oneX = state.speed === 1;
+      const oneXAlpha = oneX ? 0.8 : 0.55;
       for (let ti = 0; ti < vehData.trips.length && pushed < VEHICLE_DOT_BUDGET; ti++) {
         const trip = vehData.trips[ti];
         const pos = vehiclePosition(trip, state.t, vehData);
         if (!pos) continue;
         const [x, y] = pos;
-        // AOI cull: skip if outside the current projection bbox (cheap lon/lat test).
+        // Viewport cull: skip if outside the current camera bbox (cheap lon/lat test).
         if (x < bb[0] || x > bb[2] || y < bb[1] || y > bb[3]) continue;
         const [px, py] = state.proj.fn(x, y);
         const mode = MODE_CODE(vehData.routes[trip.shape].mode);
         const c = MODE_COLORS[mode];
-        pts.push(px, py); cols.push(c[0], c[1], c[2], 0.55);
+        pts.push(px, py); cols.push(c[0], c[1], c[2], oneXAlpha);
         pushed++;
       }
-      if (pts.length) field.stampDots(Float32Array.from(pts), Float32Array.from(cols), 4.0);
+      if (pts.length) field.stampDots(Float32Array.from(pts), Float32Array.from(cols),
+                                      oneX ? 6.0 : 4.0);
     }
 
     // ---- Impact dots ---------------------------------------------------------
@@ -870,8 +972,6 @@ async function initApp() {
         const stop = eventStop[i];
         const cityCode = stopCity[stop];
         if (cityCode === REGION_ONLY_CITY_CODE) continue;
-        const cityName = CITY_NAMES[cityCode];
-        if (state.aoi !== "region" && cityName !== state.aoi) continue;
         const x = stops[2 * stop], y = stops[2 * stop + 1];
         if (x < bb[0] || x > bb[2] || y < bb[1] || y > bb[3]) continue;
         const [px, py] = state.proj.fn(x, y);

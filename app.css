@@ -14,23 +14,20 @@ body { font: 15px/1.45 system-ui, sans-serif; color: #e8e8ec; background: #10142
   background: linear-gradient(#10142000, #101420dd 30%, #101420 100%);
   display: flex; flex-direction: column; gap: 8px; }
 
-#aoi-picker, #district-picker { display: flex; gap: 6px; flex-wrap: wrap; }
-#aoi-picker button, #district-picker button, #speed-presets button, #play-pause, #transport button {
+#aoi-picker { display: flex; gap: 6px; flex-wrap: wrap; }
+#aoi-picker button, #speed-presets button, #play-pause, #transport button {
   padding: 6px 14px; border: 1px solid #2a313d; background: rgba(16,20,32,.82); color: #c7ccd6;
   border-radius: 999px; cursor: pointer; font: inherit; font-size: 13px; transition: all .15s;
 }
-#aoi-picker button.active, #district-picker button.active, #speed-presets button.active {
+#aoi-picker button.active, #speed-presets button.active {
   background: #6fd3e6; color: #061014; border-color: #6fd3e6; font-weight: 600;
 }
-/* District row reads as a secondary tier under the AOI row: slightly smaller
-   chips, dimmer border, no wrap-gap surprise on narrow screens. */
-#district-picker button { padding: 5px 12px; font-size: 12px; }
-#district-picker[hidden] { display: none; }
-
 #speed-presets { display: flex; gap: 6px; }
 #transport { display: inline-flex; gap: 6px; align-items: center; }
 #play-pause { min-width: 40px; text-align: center; }
 #clock { font-variant-numeric: tabular-nums; font-size: 15px; color: #fff; }
+/* 1x whisper: a quiet "next ripple · 12s" line under the clock (spec §4) */
+#whisper { font-size: 12px; color: #7d8494; min-height: 1.2em; font-variant-numeric: tabular-nums; }
 
 #scrubber { width: 100%; accent-color: #6fd3e6; }
 
@@ -80,7 +77,7 @@ body { font: 15px/1.45 system-ui, sans-serif; color: #e8e8ec; background: #10142
 }
 #intro-begin:hover, #step-next:hover, #step-explore:hover { background: #8fe0f0; }
 #intro-begin:focus-visible, #step-next:focus-visible, #step-explore:focus-visible,
-#play-pause:focus-visible, #aoi-picker button:focus-visible, #district-picker button:focus-visible,
+#play-pause:focus-visible, #aoi-picker button:focus-visible,
 #speed-presets button:focus-visible, #transport button:focus-visible {
   outline: 2px solid #fff; outline-offset: 2px;
 }
@@ -91,12 +88,46 @@ body { font: 15px/1.45 system-ui, sans-serif; color: #e8e8ec; background: #10142
 #step-explore { background: transparent; color: #6fd3e6; }
 #step-explore:hover { background: rgba(111,211,230,.12); }
 
+/* ---------- v2.2 right-side district panel ---------- */
+#district-panel { position: fixed; top: 0; right: 0; bottom: 0; z-index: 6;
+  display: flex; align-items: center; pointer-events: none; }
+#district-panel[hidden] { display: none !important; }
+#dp-tab { pointer-events: auto; writing-mode: vertical-rl; padding: 14px 6px;
+  border: 1px solid #2a313d; border-right: none; border-radius: 10px 0 0 10px;
+  background: rgba(16,20,32,.82); color: #c7ccd6; cursor: pointer;
+  font: 12px/1 system-ui, sans-serif; letter-spacing: .12em; text-transform: uppercase;
+  opacity: .6; transition: opacity .15s; }
+#dp-tab:hover, #district-panel.open #dp-tab { opacity: 1; }
+#dp-body { pointer-events: auto; width: 260px; max-height: 78vh; overflow-y: auto;
+  background: rgba(14,18,30,.9); border: 1px solid #2a313d; border-right: none;
+  border-radius: 12px 0 0 12px; padding: 10px 8px; backdrop-filter: blur(6px); }
+#dp-body[hidden] { display: none; }
+.dp-city { font: 11px/1 monospace; letter-spacing: .1em; text-transform: uppercase;
+  color: #6fd3e6; margin: 10px 6px 4px; }
+.dp-city:first-child { margin-top: 2px; }
+#dp-list button { display: block; width: 100%; text-align: left; padding: 5px 10px;
+  border: none; border-radius: 7px; background: transparent; color: #c7ccd6;
+  cursor: pointer; font: inherit; font-size: 13px; }
+#dp-list button.dp-child { padding-left: 24px; font-size: 12px; color: #9aa1ad; }
+#dp-list button:hover { background: rgba(111,211,230,.10); color: #fff; }
+#dp-list button.active { background: rgba(111,211,230,.18); color: #6fd3e6; }
+#dp-list button:focus-visible { outline: 2px solid #fff; outline-offset: -2px; }
+
+@media (max-width: 640px) {
+  /* bottom sheet: tab sits above the chrome bar; body slides up full-width */
+  #district-panel { top: auto; right: 0; left: 0; bottom: 0; align-items: flex-end;
+    flex-direction: column; z-index: 8; }
+  #dp-tab { writing-mode: horizontal-tb; align-self: flex-end;
+    margin: 0 14px 148px 0; border-right: 1px solid #2a313d; border-radius: 10px; }
+  #dp-body { width: 100%; max-height: 46vh; border-radius: 12px 12px 0 0;
+    border-right: 1px solid #2a313d; }
+}
+
 /* ---------- MOBILE ---------- */
 @media (max-width: 640px) {
   #chrome { padding: 8px 10px 12px; }
-  #aoi-picker, #district-picker { justify-content: center; }
+  #aoi-picker { justify-content: center; }
   #aoi-picker button, #speed-presets button, #play-pause, #transport button { padding: 5px 10px; font-size: 12px; }
-  #district-picker button { padding: 4px 9px; font-size: 11px; }
   #clock { text-align: center; }
   #intro-card, #stepper-card { padding: 20px 20px; }
   #intro-title { font-size: 19px; }

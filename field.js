@@ -43,6 +43,26 @@ export function clampSkip(t, deltaSec, dataMin, dataMax) {
 export function inBbox(x, y, bbox) {
   return x >= bbox[0] && x <= bbox[2] && y >= bbox[1] && y <= bbox[3];
 }
+// rippleLifeHorizon — v2.2 1x liveliness (spec §4): at real-time speed a
+// droplet the viewer waited for should linger long enough to savor (14s);
+// every other speed keeps the tuned 8s ceiling.
+export function rippleLifeHorizon(speed) {
+  return speed === 1 ? 14.0 : 8.0;
+}
+// nextEventInView — the "next ripple · Ns" whisper's lookup: scan forward
+// from the event cursor for the first event whose stop lies in the viewport
+// bbox. Bounded (maxScan) so a viewport with no service can't scan the whole
+// stream every status tick.
+export function nextEventInView(eventTime, eventStop, stops, fromPtr, bbox, maxScan = 5000) {
+  const end = Math.min(eventTime.length, fromPtr + maxScan);
+  for (let i = fromPtr; i < end; i++) {
+    const stop = eventStop[i];
+    if (inBbox(stops[2 * stop], stops[2 * stop + 1], bbox)) {
+      return { simSec: eventTime[i], stop };
+    }
+  }
+  return null;
+}
 // bandBrightness mirrors ripplesim.ripple.edge_brightness (the Python reference):
 // a moving BAND — bright crest at the wavefront (front = age*frontSpeed) + a faint
 // trailing wake — NOT a filled disc. This is the fix for the "whole street brightens"
