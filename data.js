@@ -37,8 +37,17 @@ export async function loadAll(dir) {
       loadBin(dir, "shape_coords", "f32").catch(() => null),
       loadBin(dir, "shape_cumdist", "f32").catch(() => null),
     ]);
+  // Districts (Task 5 bake, Task 6 UI): optional chrome, not core data — an
+  // older deploy without districts.json must not break the app.
+  let districts = null;
+  try {
+    const r = await fetch(`${dir}/districts.json`);
+    if (r.ok) districts = await r.json();
+  } catch (_) { /* districts are optional chrome, not core data */ }
+
   return { manifest, stops, stopMode, stopCity, stampEdge, stampDelay,
            stampIntensity, stampIndex, eventStop, eventTime, streets,
            vehicleTripBpTime, vehicleTripBpDist, vehicleShapeCoords, vehicleShapeCumdist,
-           routes: manifest.routes || null, trips: manifest.trips || null };
+           routes: manifest.routes || null, trips: manifest.trips || null,
+           districts };
 }

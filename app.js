@@ -14,7 +14,7 @@
 // flash at a stop the instant its event fires.
 
 import { loadAll } from "./data.js";
-import { makeProjection, eventsInWindow, RippleField } from "./field.js";
+import { makeProjection, eventsInWindow, RippleField, realAge, clampSkip, inBbox } from "./field.js";
 import { vehiclePosition } from "./vehicles.js";
 
 // ---- AOI bboxes (lon/lat), mirrored from src/region.py EXACTLY -----------
@@ -76,6 +76,8 @@ async function initApp() {
   const clockEl = document.getElementById("clock");
   const scrubberEl = document.getElementById("scrubber");
   const playPauseEl = document.getElementById("play-pause");
+  const skipBackEl = document.getElementById("skip-back");
+  const skipFwdEl = document.getElementById("skip-fwd");
   const speedButtons = Array.from(document.querySelectorAll("#speed-presets button"));
   const aoiButtons = Array.from(document.querySelectorAll("#aoi-picker button"));
   const chromeEl = document.getElementById("chrome");
@@ -86,6 +88,8 @@ async function initApp() {
   const stepCaptionEl = document.getElementById("step-caption");
   const stepNextEl = document.getElementById("step-next");
   const stepExploreEl = document.getElementById("step-explore");
+  const helpBtnEl = document.getElementById("help-btn");
+  const INTRO_SEEN_KEY = "hr-intro-seen";
 
   // ---- WebGL2 availability check (self-review requirement) --------------
   const gl = canvas.getContext("webgl2");
@@ -124,18 +128,28 @@ async function initApp() {
   const streets = d.streets;
   const stops = d.stops; // flat [x0,y0, x1,y1, ...] per stop (lon/lat)
   const horizonSec = manifest.horizon_sec;
+  const districts = d.districts; // Task 5 bake: {source, <city>: [{name,bbox,ring}...]} or null (older deploy)
 
-  // Band-shader ripple params (Task 8's edge_brightness formula), read from
-  // the manifest with sane fallbacks so an older bake without a `ripple`
-  // block still renders (just with default-tuned crest/wake/life values).
-  const rp = manifest.ripple || {};
+  // v2.1: band params are REAL-seconds tuned (see field.js realAge). Prefer
+  // the manifest's ripple_real block; fall back to the same values hardcoded
+  // so an older cached manifest can't resurrect the sim-seconds blink.
+  const rp = manifest.ripple_real || {};
   const RIPPLE_PARAMS = {
-    frontSpeed: rp.front_speed ?? 1.0,
-    thickness: rp.thickness ?? 20.0,
-    wakeTau: rp.wake_tau ?? 60.0,
+    frontSpeed: rp.front_speed ?? 36.0,
+    thickness: rp.thickness ?? 14.0,
+    wakeTau: rp.wake_tau ?? 45.0,
     wakeLevel: rp.wake_level ?? 0.35,
-    lifeTau: rp.life_tau ?? 90.0,
+    lifeTau: rp.life_tau ?? 3.0,
   };
+
+  // Guided-intro snapshot params: same band, but life decay disabled so the
+  // whole isochrone reads at crest brightness (age varies per edge; without
+  // this the far edges dim to ~0.19 of the near ones under life_tau=3).
+  const INTRO_PARAMS = { ...RIPPLE_PARAMS, lifeTau: 1e9 };
+
+  // Real-seconds visual life ceiling: crest sweep (horizon/frontSpeed = 5s)
+  // + wake/life tail. Events older than this are invisible; retire them.
+  const RIPPLE_LIFE_HORIZON_REAL_SEC = 8.0;
 
   // Vehicle data (Task 9, Option A: sim-in-JS interpolation). Guarded: an
   // older bake without vehicle bins/manifest.vehicle leaves vehData null,
@@ -170,6 +184,7 @@ async function initApp() {
     speed: 60,
     paused: false,
     aoi: "region",
+    district: null, // null | {name, bbox, ring} — a focused district within state.aoi's city
     sePtr: 0,
     proj: null,
     lastFrameTs: null,
@@ -202,6 +217,7 @@ async function initApp() {
     if (ts - lastStatusTs < STATUS_INTERVAL_MS) return;
     lastStatusTs = ts;
     const str = "aoi " + state.aoi + " | speed " + state.speed + "x" +
+      (state.speed === 1 && !state.paused ? " (real-time — events are rare)" : "") +
       (state.paused ? " | paused" : "") +
       " | " + Math.round(fpsValue) + " fps";
     if (str !== lastStatusStr) {
@@ -225,15 +241,52 @@ async function initApp() {
   // canvas (e.g. clear of the bottom-anchored #stepper-card during the guided
   // intro), so a seeded ripple never lands directly underneath opaque UI
   // chrome. Free-explore always passes the full height (default), unchanged.
+  const overlay = document.getElementById("overlay");
+  const octx = overlay.getContext("2d");
+
+  // viewBbox — the bbox currently governing camera + admission + dot culls:
+  // a focused district's bbox when set, else the whole AOI's bbox. Shared by
+  // fitProjection, resolveStopBuffer, and both dot-cull loops so a district
+  // focus and the AOI fallback can never drift apart.
+  function viewBbox() {
+    return state.district ? state.district.bbox : AOIS[state.aoi];
+  }
+
   function fitProjection(usableH) {
     const w = canvas.clientWidth || window.innerWidth;
     const h = canvas.clientHeight || window.innerHeight;
     canvas.width = w;
     canvas.height = h;
     field.resize(w, h);
-    state.proj = makeProjection(bboxObj(AOIS[state.aoi]), w, usableH || h, 24);
+    const bb = state.district ? bboxObj(state.district.bbox) : bboxObj(AOIS[state.aoi]);
+    state.proj = makeProjection(bb, w, usableH || h, 24);
+    drawDistrictOutline();
   }
   window.addEventListener("resize", () => fitProjection());
+
+  // drawDistrictOutline — the focused district's ring as a faint STATIC line,
+  // drawn once per camera change (not per rAF frame: the band shader's own
+  // additive stamp pipeline would animate it, and stampDots only does points —
+  // a plain 2D overlay canvas is the simplest correct tool for a static shape).
+  // Sized to match the map canvas every call so a resize never leaves it
+  // stale/mis-scaled.
+  function drawDistrictOutline() {
+    overlay.width = canvas.width;
+    overlay.height = canvas.height;
+    octx.clearRect(0, 0, overlay.width, overlay.height);
+    if (!state.district) return;
+    octx.strokeStyle = "rgba(255,255,255,0.12)";
+    octx.lineWidth = 1;
+    octx.beginPath();
+    const ring = state.district.ring;
+    for (let i = 0; i < ring.length; i++) {
+      const [px, py] = state.proj.fn(ring[i][0], ring[i][1]);
+      if (i === 0) octx.moveTo(px, py); else octx.lineTo(px, py);
+    }
+    octx.closePath();
+    octx.stroke();
+  }
+
   fitProjection();
 
   // ---- clock / scrubber formatting ---------------------------------------
@@ -266,30 +319,116 @@ async function initApp() {
 
   function setPaused(p) {
     state.paused = p;
-    playPauseEl.textContent = p ? "▶" : "❬❬";
+    playPauseEl.textContent = p ? "▶" : "⏸";
+    playPauseEl.title = p ? "Play (Space)" : "Pause (Space)";
     playPauseEl.setAttribute("aria-pressed", String(p));
   }
   playPauseEl.addEventListener("click", () => setPaused(!state.paused));
   setPaused(false);
   setSpeed(60);
 
+  // ---- ±15min skip: identical hard-jump idiom to the scrubber handler
+  // above (clear the field, resync sePtr, drop stale in-flight wavefronts).
+  function skipBy(deltaSec) {
+    state.t = clampSkip(state.t, deltaSec, dataMin, dataMax);
+    state.sePtr = lowerBound(eventTime, state.t);
+    field.resize(canvas.width, canvas.height); // clears both textures
+    clearActiveEvents();
+    updateScrubberFromT();
+    clockEl.textContent = formatClock(state.t);
+  }
+  skipBackEl.addEventListener("click", () => skipBy(-900));
+  skipFwdEl.addEventListener("click", () => skipBy(900));
+
+  // ---- Space toggles pause, unless the user is interacting with an input
+  // or a button (native Space-activates-focused-button behavior wins there
+  // so we don't fight it / double-toggle).
+  window.addEventListener("keydown", (e) => {
+    if (e.code !== "Space") return;
+    const tag = document.activeElement?.tagName;
+    if (tag === "INPUT" || tag === "BUTTON") return;
+    e.preventDefault();
+    setPaused(!state.paused);
+  });
+
   // ---- AOI picker: reframe the projection to the chosen city's bbox and
   // (via the rAF loop's stamp filter, below) restrict stamped ripples to
   // that city's own street segments. Region shows every city, unfiltered.
   function focusAOI(name, usableH) {
+    state.district = null; // a district belongs to one city; never survives an AOI switch
     state.aoi = name;
     aoiButtons.forEach((b) => b.classList.toggle("active", b.dataset.aoi === name));
     fitProjection(usableH); // reprojects to AOIS[name] AND clears the field (field.resize)
     state.sePtr = lowerBound(eventTime, state.t); // hard re-sync, like a scrub
     clearActiveEvents(); // stale wavefronts reference the OLD AOI's resolved city buffer
+    renderDistrictPicker();
   }
   aoiButtons.forEach((b) => b.addEventListener("click", () => focusAOI(b.dataset.aoi)));
+
+  // ---- District picker (Task 6): a second chip row that appears once a city
+  // AOI is focused, listing that city's major districts (from the Task 5
+  // bake) as camera presets. "All" clears the focus back to the whole city.
+  // Region view has no districts list, so the row stays hidden there.
+  const districtPickerEl = document.getElementById("district-picker");
+
+  function renderDistrictPicker() {
+    const list = (districts && state.aoi !== "region" && districts[state.aoi]) || null;
+    districtPickerEl.hidden = !list;
+    districtPickerEl.textContent = "";
+    if (!list) return;
+    const mk = (label, dist) => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.textContent = label;
+      b.classList.toggle("active", (state.district?.name ?? null) === (dist?.name ?? null));
+      b.addEventListener("click", () => focusDistrict(dist));
+      districtPickerEl.appendChild(b);
+    };
+    mk("All", null);
+    for (const dist of list) mk(dist.name, dist);
+  }
+
+  // District select = same hard-jump semantics as an AOI change: refit the
+  // camera (clears the field via fitProjection->field.resize), resync the
+  // event cursor, drop stale in-flight wavefronts.
+  function focusDistrict(dist) {
+    state.district = dist;
+    fitProjection();
+    state.sePtr = lowerBound(eventTime, state.t);
+    clearActiveEvents();
+    renderDistrictPicker();
+  }
 
   // ---- initial cursor position --------------------------------------------
   state.sePtr = lowerBound(eventTime, state.t);
   updateScrubberFromT();
   clockEl.textContent = formatClock(state.t);
-  introBeginEl.focus();
+  renderDistrictPicker(); // boot state is aoi:"region" — row starts hidden
+
+  // v2.1 intro: ONE dismissible card, sim PLAYING behind it, remembered.
+  // The 3-step guided tour still exists — now opt-in behind the ? button.
+  function dismissIntro() {
+    introEl.hidden = true;
+    chromeEl.hidden = false;
+    try { localStorage.setItem(INTRO_SEEN_KEY, "1"); } catch (_) {}
+    playPauseEl.focus();
+  }
+  let introSeen = false;
+  try { introSeen = localStorage.getItem(INTRO_SEEN_KEY) === "1"; } catch (_) {}
+  if (introSeen) {
+    introEl.hidden = true;
+    chromeEl.hidden = false;
+  } else {
+    introBeginEl.focus();
+  }
+  introBeginEl.addEventListener("click", dismissIntro);
+
+  helpBtnEl.addEventListener("click", () => {
+    const wasPaused = state.paused;
+    chromeEl.hidden = true;
+    beginStory(); // 3-step tour; steps 1-2 pause (as designed, now opt-in)
+    tourResumePaused = wasPaused;
+  });
 
   // ---- guided intro: 3-step click-stepper (Task 10) -----------------------
   // Bremer/Visual Cinnamon click-stepper: a step counter + a single "Next"
@@ -333,6 +472,7 @@ async function initApp() {
     },
   ];
   let storyStep = 0;
+  let tourResumePaused = false;
 
   function renderStep() {
     stepNumEl.textContent = String(storyStep + 1);
@@ -359,10 +499,10 @@ async function initApp() {
     // playback continues forward from state.t instead of re-sweeping
     // whatever the scripted steps left sePtr pointing at.
     state.sePtr = lowerBound(eventTime, state.t);
+    setPaused(tourResumePaused); // restore whatever play state ? was clicked in
     playPauseEl.focus();
   }
 
-  introBeginEl.addEventListener("click", beginStory);
   stepNextEl.addEventListener("click", () => {
     if (storyStep < STORY_STEPS.length - 1) {
       storyStep++;
@@ -421,6 +561,11 @@ async function initApp() {
     if (cityCode === REGION_ONLY_CITY_CODE) return null; // no street buffer for this stop
     const cityName = CITY_NAMES[cityCode];
     if (state.aoi !== "region" && cityName !== state.aoi) return null; // wrong city for this AOI
+    if (state.district &&
+        !inBbox(stops[2 * stop], stops[2 * stop + 1], state.district.bbox)) {
+      return null; // outside the focused district — bbox test; edge spill-over
+                    // from admitted stops still renders (whole-city street buffer)
+    }
     const segArr = streets[cityName];
     if (!segArr) return null;
     return { segArr, mode: stopMode[stop], off: stampIndex[2 * stop], cnt };
@@ -449,7 +594,7 @@ async function initApp() {
   // Draw whatever pushEdge() has accumulated into modeSegs/modeDelays/modeAges,
   // grouped by mode (one draw call per mode, additive blend). Shared by
   // the rAF loop and the scripted intro (seedStopRipple).
-  function flushStamps() {
+  function flushStamps(params = RIPPLE_PARAMS) {
     for (let m = 0; m < modeSegs.length; m++) {
       if (modeSegs[m].length === 0) continue;
       field.stamp(
@@ -457,7 +602,7 @@ async function initApp() {
         Float32Array.from(modeDelays[m]),
         Float32Array.from(modeAges[m]),
         MODE_COLORS[m],
-        RIPPLE_PARAMS
+        params
       );
     }
   }
@@ -484,7 +629,7 @@ async function initApp() {
     for (const arr of modeDelays) arr.length = 0;
     for (const arr of modeAges) arr.length = 0;
     for (const stop of stops) stampEventAllAtOnce(stop);
-    flushStamps();
+    flushStamps(INTRO_PARAMS);
     // Also persist the resolved buffers so the rAF loop's per-frame
     // field.clearField() doesn't wipe this seed on the very next frame (see
     // restampSeededStops below) — a one-shot stampEventAllAtOnce alone only
@@ -558,8 +703,10 @@ async function initApp() {
     let write = 0;
     for (let i = 0; i < activeEvents.length; i++) {
       const ev = activeEvents[i];
-      const age = now - ev.fireTime;
-      if (age >= horizonSec) continue; // retire: past the baked isochrone horizon
+      const age = realAge(now - ev.fireTime, state.speed);
+      // retire on REAL age (visual life over) OR a sim-age cap so scrubbing
+      // far ahead can't keep a huge stale population alive at high speed.
+      if (age >= RIPPLE_LIFE_HORIZON_REAL_SEC || now - ev.fireTime >= 5 * horizonSec) continue;
       const { segArr, mode, off, cnt } = ev.buf;
       for (let k = off; k < off + cnt; k++) pushEdge(segArr, mode, k, age);
       activeEvents[write++] = ev;
@@ -662,9 +809,20 @@ async function initApp() {
     // restampActiveEvents' doc comment for the cost-bound argument). This
     // runs even when paused (dtSim === 0) so the field stays lit between
     // frames instead of flashing empty (clearField() above wiped it).
+    //
+    // Live and seeded (guided-intro) stamps are flushed SEPARATELY, each with
+    // its own params (RIPPLE_PARAMS for live, INTRO_PARAMS — life decay off —
+    // for the paused snapshot): a single shared flush would force one lifeTau
+    // on both, either blinking the live ripples or freezing the intro's decay.
     restampActiveEvents();
+    flushStamps();                      // live events, RIPPLE_PARAMS
+
+    for (const arr of modeSegs) arr.length = 0;
+    for (const arr of modeDelays) arr.length = 0;
+    for (const arr of modeAges) arr.length = 0;
+
     restampSeededStops();
-    flushStamps();
+    flushStamps(INTRO_PARAMS);          // intro snapshot, life decay off
 
     // ---- Vehicle dots (Task 9 Part D, Option A) -----------------------------
     // Interpolate every live trip's XY in JS at state.t (ported, tested
@@ -674,7 +832,7 @@ async function initApp() {
     // frame has no meaningful "live" vehicle set — state.t isn't advancing).
     if (vehData && vehicleMeta && !state.paused) {
       const pts = [], cols = [];
-      const bb = AOIS[state.aoi];
+      const bb = viewBbox();
       let pushed = 0;
       for (let ti = 0; ti < vehData.trips.length && pushed < VEHICLE_DOT_BUDGET; ti++) {
         const trip = vehData.trips[ti];
@@ -686,10 +844,10 @@ async function initApp() {
         const [px, py] = state.proj.fn(x, y);
         const mode = MODE_CODE(vehData.routes[trip.shape].mode);
         const c = MODE_COLORS[mode];
-        pts.push(px, py); cols.push(c[0], c[1], c[2], 0.9);
+        pts.push(px, py); cols.push(c[0], c[1], c[2], 0.55);
         pushed++;
       }
-      if (pts.length) field.stampDots(Float32Array.from(pts), Float32Array.from(cols), 5.0);
+      if (pts.length) field.stampDots(Float32Array.from(pts), Float32Array.from(cols), 4.0);
     }
 
     // ---- Impact dots ---------------------------------------------------------
@@ -703,6 +861,7 @@ async function initApp() {
       let lo = lowerBound(eventTime, cutoff);
       const hi = state.sePtr; // events up to (not including) the not-yet-activated tail
       const pts = [], cols = [];
+      const bb = viewBbox();
       for (let i = lo; i < hi; i++) {
         const et = eventTime[i];
         if (et > state.t) continue; // defensive: shouldn't happen (sePtr is forward-only)
@@ -714,14 +873,13 @@ async function initApp() {
         const cityName = CITY_NAMES[cityCode];
         if (state.aoi !== "region" && cityName !== state.aoi) continue;
         const x = stops[2 * stop], y = stops[2 * stop + 1];
-        const bb = AOIS[state.aoi];
         if (x < bb[0] || x > bb[2] || y < bb[1] || y > bb[3]) continue;
         const [px, py] = state.proj.fn(x, y);
-        const alpha = 1 - age / IMPACT_FADE_SIM_SEC;
+        const alpha = (1 - age / IMPACT_FADE_SIM_SEC) * 0.6;
         const c = MODE_COLORS[stopMode[stop]];
         pts.push(px, py); cols.push(c[0], c[1], c[2], alpha);
       }
-      if (pts.length) field.stampDots(Float32Array.from(pts), Float32Array.from(cols), 8.0);
+      if (pts.length) field.stampDots(Float32Array.from(pts), Float32Array.from(cols), 7.0);
     }
 
     field.present();

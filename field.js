@@ -20,6 +20,29 @@ export function eventsInWindow(eventTime, ptr, tNow) {
   while (hi < eventTime.length && eventTime[hi] <= tNow) hi++;
   return { events: [ptr, hi], nextPtr: hi };
 }
+// realAge — the v2.1 "watchable at every speed" conversion. Ripple animation
+// runs on REAL seconds: an event's sim-age is divided by playback speed at
+// use time, so a droplet's visual life is ~7s at 1x, 60x and 300x alike.
+// (v2.0 fed sim-age straight to the band shader, so at 60x a whole ripple
+// lived 3 real-seconds — the "blinking lights" bug.) Sim-time still drives
+// WHEN events fire; only the animation clock is real-time. Pause/scrub
+// correctness is inherited from sim-time (it freezes/resyncs already).
+export function realAge(simAge, speed) {
+  return simAge / speed;
+}
+// clampSkip — the ±15min transport skip idiom: apply a delta-sec jump to t,
+// clamped to the data window (same clamp shape the scrubber's frac already
+// enforces via min(1,max(0,...)), just in raw sim-seconds here).
+export function clampSkip(t, deltaSec, dataMin, dataMax) {
+  return Math.min(dataMax, Math.max(dataMin, t + deltaSec));
+}
+// inBbox — inclusive lon/lat containment test against a [w,s,e,n] bbox array
+// (the districts.json shape). Used both for event-admission filtering (Task 6)
+// and could double for dot culls; boundary-inclusive by design (bbox tests
+// admit edge spill-over — see Task 6 brief).
+export function inBbox(x, y, bbox) {
+  return x >= bbox[0] && x <= bbox[2] && y >= bbox[1] && y <= bbox[3];
+}
 // bandBrightness mirrors ripplesim.ripple.edge_brightness (the Python reference):
 // a moving BAND — bright crest at the wavefront (front = age*frontSpeed) + a faint
 // trailing wake — NOT a filled disc. This is the fix for the "whole street brightens"
