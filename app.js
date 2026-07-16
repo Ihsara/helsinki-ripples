@@ -15,7 +15,7 @@
 
 import { loadAll } from "./data.js";
 import { makeProjection, eventsInWindow, RippleField, realAge, clampSkip,
-         rippleLifeHorizon, nextEventInView } from "./field.js";
+         rippleLifeHorizon, nextEventInView, whisperText } from "./field.js";
 import { vehiclePosition } from "./vehicles.js";
 import { createCamera, cameraProjection, panBy, zoomAboutPoint, resizeCamera,
          startFlyTo, stepFlyTo, visibleBbox } from "./camera.js";
@@ -233,7 +233,7 @@ async function initApp() {
       const nxt = nextEventInView(eventTime, eventStop, stops, state.sePtr, viewBbox());
       if (nxt) {
         const dsec = Math.max(0, Math.round(nxt.simSec - state.t));
-        w = dsec <= 1 ? "ripple…" : `next ripple · ${dsec}s`;
+        w = whisperText(dsec);
       }
     }
     if (whisperEl && w !== whisperEl.textContent) whisperEl.textContent = w;

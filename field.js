@@ -63,6 +63,11 @@ export function nextEventInView(eventTime, eventStop, stops, fromPtr, bbox, maxS
   }
   return null;
 }
+export function whisperText(dsec) {
+  if (dsec <= 1) return "ripple…";
+  if (dsec <= 120) return `next ripple · ${dsec}s`;
+  return "";
+}
 // bandBrightness mirrors ripplesim.ripple.edge_brightness (the Python reference):
 // a moving BAND — bright crest at the wavefront (front = age*frontSpeed) + a faint
 // trailing wake — NOT a filled disc. This is the fix for the "whole street brightens"
