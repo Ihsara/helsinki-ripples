@@ -45,6 +45,18 @@ body { font: 15px/1.45 system-ui, sans-serif; color: #e8e8ec; background: #10142
 #help-btn:hover, #help-btn:focus-visible { opacity: 1; background: rgba(16,20,32,.92); }
 #help-btn:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
 
+/* Discreet re-entry into the static poster gallery (v2.3), same chip
+   language as #help-btn, parked just to its left. */
+#posters-link {
+  position: fixed; right: 50px; bottom: 14px; z-index: 7;
+  width: 28px; height: 28px; padding: 0; border-radius: 50%;
+  border: 1px solid #2a313d; background: rgba(16,20,32,.7); color: #c7ccd6;
+  font: 13px/26px system-ui, sans-serif; text-align: center; text-decoration: none;
+  cursor: pointer; opacity: .55; transition: opacity .15s, background .15s;
+}
+#posters-link:hover, #posters-link:focus-visible { opacity: 1; background: rgba(16,20,32,.92); }
+#posters-link:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
+
 /* ---------- intro overlay + click-stepper ----------
    Bremer/Visual Cinnamon pattern: quiet, semi-transparent dark panels,
    generous whitespace, one idea per screen, click-to-advance only. */
